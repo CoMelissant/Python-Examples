@@ -1,6 +1,7 @@
 import json
 import math
 import re
+import time
 from http import HTTPStatus
 from os import path
 
@@ -8,15 +9,6 @@ import pandas as pd
 import plotly.express as px
 import requests
 from simian.gui import Form, component, component_properties, utils
-
-
-US_CITIES = pd.read_csv(
-    path.join(path.dirname(path.realpath(__file__)), "resources", "us-cities-top-1k.csv")
-)
-# Add label and value (index) for use in frontend waypoint selector
-# It is assumed that the data does not change so value/index is reproducible (!)
-US_CITIES["label"] = US_CITIES["City"] + " (" + US_CITIES["State"] + ")"
-US_CITIES["value"] = US_CITIES.index
 
 # Template syntax helpers for slightly more readable formio template construction using f-strings.
 # Avoids having to escape (by doubling them) the many braces used in templates. Some may not be used.
@@ -64,6 +56,15 @@ def gui_init(meta_data: dict) -> dict:
 
     # Get application data containing secrets and configurables (local mode).
     get_application_data(meta_data)
+    # Extract info from meta data
+    truck_image_base_url = meta_data["application_data"]["truck_image_base_url"]
+    here_frontend_autocomplete_delay = (
+        meta_data["application_data"]["here_frontend_autocomplete_delay_ms"] / 1000
+    )
+    here_backend_lookup_interval = (
+        meta_data["application_data"]["here_backend_lookup_interval_ms"] / 1000
+    )
+    here_frontend_api_key = meta_data["application_data"]["here_frontend_api_key"]
 
     # Create form.
     form = Form()
@@ -85,10 +86,13 @@ def gui_init(meta_data: dict) -> dict:
     }
 
     # Create two columns and add the truck and route panels to them.
-    truck_data = get_truck_data(meta_data["application_data"]["truck_image_base_url"])
+    truck_data = get_truck_data(truck_image_base_url)
     truck_panel = create_truck_panel(truck_data)
-    route_panel = create_route_panel()
-
+    route_panel = create_route_panel(
+        here_frontend_autocomplete_delay,
+        here_backend_lookup_interval,
+        here_frontend_api_key,
+    )
     cols = component.Columns("two_columns", form)
     cols.setContent([[truck_panel], [route_panel]], [6, 6])
 
@@ -100,6 +104,14 @@ def gui_event(meta_data: dict, payload: dict) -> dict:
 
     # Get application data containing secrets and configurables (local mode).
     get_application_data(meta_data)
+    # Extract info from meta data
+    here_backend_lookup_interval = (
+        meta_data["application_data"]["here_backend_lookup_interval_ms"] / 1000
+    )
+    here_backend_api_key = meta_data["application_data"]["here_backend_api_key"]
+    open_route_service_api_key = meta_data["application_data"][
+        "open_route_service_api_key"
+    ]
 
     if payload["event"] == "calculate":
         # Plotly code throws an error on a mapbox._derived key in plotly submission data
@@ -115,29 +127,72 @@ def gui_event(meta_data: dict, payload: dict) -> dict:
         truck = utils.getSubmissionData(payload, "selectTruck")
         range = truck[0]["driveTrain"]["officialRange"]
 
-        us_cities_idx = []
+        locations = []
         if waypoints:
-            # select_city values are based of US_CITIES index.
-            us_cities_idx = [waypoint["select_city"] for waypoint in waypoints]
+            # select_location values.
+            locations = [waypoint["select_location"] for waypoint in waypoints]
 
         # Should not be possible to submit with less than 2 waypoints from frontend.
-        if len(us_cities_idx) < 2:
+        if len(locations) < 2:
             payload = utils.addAlert(
                 payload,
                 "Cannot compute route, please select at least 2 waypoints (Cities).",
                 "danger",
             )
         else:
-            selected_us_cities = US_CITIES.iloc[us_cities_idx]
+            here_headers = {
+                "Accept": "application/json, application/geo+json, application/gpx+xml, img/png; charset=utf-8",
+                "Content-Type": "application/json; charset=utf-8",
+            }
+
+            locations_data = []
+            for location in locations:
+                location_id = location["id"]
+                here_call = requests.get(
+                    f"https://lookup.search.hereapi.com/v1/lookup?id={location_id}&apiKey={here_backend_api_key}",
+                    headers=here_headers,
+                )
+
+                if here_call.status_code == HTTPStatus.FORBIDDEN:
+                    payload = utils.addAlert(
+                        payload,
+                        (
+                            "Call to here.com forbidden, "
+                            f"check API key in application data ({str(here_call.status_code)} - {here_call.reason})."
+                        ),
+                        "danger",
+                    )
+                    break
+                elif not here_call.status_code == HTTPStatus.OK:
+                    payload = utils.addAlert(
+                        payload,
+                        (
+                            "Call to here.com API failed "
+                            f"({str(here_call.status_code)} - {here_call.reason})."
+                        ),
+                        "danger",
+                    )
+                    break
+                else:
+                    # Get the route infor from the web call
+                    locations_data.append(here_call.json())
+                    time.sleep(here_backend_lookup_interval)
 
             # The route
             route = {}
 
-            if not selected_us_cities.empty:
+            if len(locations_data) > 0:
                 # Call openrouteservice with waypoints and API key
+
+                lon_latList = list(
+                    map(
+                        lambda x: [x["position"]["lng"], x["position"]["lat"]],
+                        locations_data,
+                    )
+                )
                 call = get_route(
-                    selected_us_cities[["lon", "lat"]].values.tolist(),
-                    meta_data["application_data"]["open_route_service_api_key"],
+                    lon_latList,
+                    open_route_service_api_key,
                 )
 
                 if call.status_code == HTTPStatus.FORBIDDEN:
@@ -163,7 +218,7 @@ def gui_event(meta_data: dict, payload: dict) -> dict:
                     route = call.json()
 
                     # Pass waypoints and route to update the plot.
-                    update_plot(plot_obj, selected_us_cities, route)
+                    update_plot(plot_obj, locations_data, route)
 
                     # report distances and number of required charges
                     for idx, waypoint in enumerate(waypoints):
@@ -173,18 +228,26 @@ def gui_event(meta_data: dict, payload: dict) -> dict:
                             waypoint["chargeStops"] = 0
                         else:
                             waypoint["legDistance"] = (
-                                route["features"][0]["properties"]["segments"][idx - 1]["distance"]
+                                route["features"][0]["properties"]["segments"][idx - 1][
+                                    "distance"
+                                ]
                                 / 1000
                             )
                             waypoint["totalDistance"] = (
-                                waypoints[idx - 1]["totalDistance"] + waypoint["legDistance"]
+                                waypoints[idx - 1]["totalDistance"]
+                                + waypoint["legDistance"]
                             )
-                            waypoint["chargeStops"] = waypoints[idx - 1]["chargeStops"] + math.ceil(
-                                waypoint["legDistance"] / range
+                            #                            waypoint["chargeStops"] = waypoints[idx - 1]["chargeStops"] + math.ceil(
+                            #                                waypoint["legDistance"] / range
+                            #                            )
+                            waypoint["chargeStops"] = math.ceil(
+                                waypoint["totalDistance"] / range
                             )
 
                     # Update the payload with the waypoint info.
-                    payload, _ = utils.setSubmissionData(payload, "waypoints", waypoints)
+                    payload, _ = utils.setSubmissionData(
+                        payload, "waypoints", waypoints
+                    )
 
                     # Update the payload with the new values in the Plotly object.
                     payload, _ = utils.setSubmissionData(payload, "plot", plot_obj)
@@ -198,7 +261,11 @@ def gui_event(meta_data: dict, payload: dict) -> dict:
     return payload
 
 
-def create_route_panel() -> component.Panel:
+def create_route_panel(
+    here_frontend_autocomplete_delay,
+    here_backend_lookup_interval,
+    here_frontend_api_key,
+) -> component.Panel:
     # Create the panel
     route_panel = component.Panel("route_panel")
     route_panel.title = """Route by <a href="https://openrouteservice.org" target="_blank"><u>openrouteservice.org</u></a>"""
@@ -207,8 +274,8 @@ def create_route_panel() -> component.Panel:
     # Create plot with some initial data.
     plot_obj = component.Plotly("plot", route_panel)
     plot_obj.aspectRatio = 2
-    update_plot(plot_obj, US_CITIES.loc[[]], {})
 
+    update_plot(plot_obj, [], {})
     # Data grid for waypoints selection and results presentation
     waypoints = component.DataGrid("waypoints", route_panel)
     waypoints.label = "Way points"
@@ -221,13 +288,31 @@ def create_route_panel() -> component.Panel:
     validate_waypoints.maxLength = 4
     validate_waypoints.customMessage = "Route must consist of 2, 3, or 4 waypoints."
 
-    # Select component in data grid for waypoint (city) selection.
-    select_city = component.Select("select_city", waypoints)
-    select_city.label = "City"
-    select_city.block = True  # Make the button fill the entire horizontal space of the parent.
-    select_city.widget = "html5"
-    select_city.data = dict(values=US_CITIES[["value", "label"]])
-    select_city.setRequired()
+    # Select component in data grid for waypoint (location) selection.
+    # https://formio.github.io/formio.js/app/sandbox is a great place to interactively figure out and test the (data) settings for the select component.
+    select_location = component.Select("select_location", waypoints)
+    select_location.label = """Location<span class="font-weight-normal"> (by <a class="text-decoration-underline" href="https://here.com" target="_blank">here.com</a>)</span>"""
+    select_location.block = (
+        True  # Make the button fill the entire horizontal space of the parent.
+    )
+    select_location.widget = "ChoicesJS"
+    select_location.dataSrc = "url"
+    select_location.data = dict(
+        url="https://autocomplete.search.hereapi.com/v1/autocomplete"
+    )
+    select_location.valuePoperty = "id"
+    select_location.template = "<span>{{ item.title }}</span>"
+    select_location.selectValues = "items"
+    select_location.searchField = "q"
+    select_location.filter = "apiKey=" + here_frontend_api_key
+    select_location.limit = 5
+    select_location.searchDebounce = here_frontend_autocomplete_delay
+    select_location.errorLabel = "Location"
+    placeholder = "Type to search"
+    if here_frontend_autocomplete_delay:
+        placeholder = f"{placeholder} ({here_frontend_autocomplete_delay}s delay)"
+    select_location.placeholder = placeholder
+    select_location.setRequired()
 
     # Number component in data grid to display leg distance
     leg_dist = component.Number("legDistance", waypoints)
@@ -252,6 +337,12 @@ def create_route_panel() -> component.Panel:
     charge_stops.requireDecimal = False
     charge_stops.delimiter = True
     charge_stops.disabled = True
+
+    # Add rate limit disclaimer only if one of the delays non zero
+    if here_frontend_autocomplete_delay or here_backend_lookup_interval:
+        rate_limit_disclaimer = component.HtmlElement("rate_disclaimer", route_panel)
+        rate_limit_disclaimer.tag = "p"
+        rate_limit_disclaimer.content = f"""<small><i class="fa fa-exclamation-circle text-danger"></i> To avoid demo service disruption caused by applicable here.com rate limitations under our plan, delays are implemented for front-end autocompletion search ({here_frontend_autocomplete_delay}s), and between waypoint info lookups in the backend ({here_backend_lookup_interval}s). These delays do noticably impact performance, and can be removed when running this demo under your own here.com account.</small>"""
 
     # Calculate button
     calculate = component.Button("calculate", route_panel)
@@ -468,19 +559,21 @@ def get_truck_details_table_template(details) -> str:
     table_html = f'<table class="{table_classes}">'
 
     # Table header and start body
-    table_html += f'<thead><tr><td colspan="2"><b>{details["title"]}</b></td></tr></thead><tbody>'
+    table_html += (
+        f'<thead><tr><td colspan="2"><b>{details["title"]}</b></td></tr></thead><tbody>'
+    )
 
     # Table body rows
     for row in details["rows"]:
         # Formio template code to display value if set, otherwise show dash
         # Uses javascript ternary operator:
         # condition ? exprIfTrue : exprIfFalse
-        value_template = (
-            f'{TMPL_DISPLAY_DATA_START}{row["value"]} ? {row["value"]} : "-"{TMPL_DISPLAY_DATA_END}'
-        )
+        value_template = f'{TMPL_DISPLAY_DATA_START}{row["value"]} ? {row["value"]} : "-"{TMPL_DISPLAY_DATA_END}'
 
         # Row with cells containing template code
-        table_html += f'<tr><td>{row["label"]}</td><td>{value_template} {row["unit"]}</td></tr>'
+        table_html += (
+            f'<tr><td>{row["label"]}</td><td>{value_template} {row["unit"]}</td></tr>'
+        )
 
     # Table body and table end
     table_html += "</tbody></table>"
@@ -488,7 +581,7 @@ def get_truck_details_table_template(details) -> str:
     return table_html
 
 
-def update_plot(plot_obj, selected_us_cities, route):
+def update_plot(plot_obj, locations_data, route):
     """Update the plot with waypoint and route data."""
     lon = []
     lat = []
@@ -503,14 +596,29 @@ def update_plot(plot_obj, selected_us_cities, route):
         lon, lat = map(list, zip(*route["features"][0]["geometry"]["coordinates"]))
         auto_zoom = calculate_zoom(lon, lat)
 
+    # suboptimal conversion moving from static file based data to here.com data
+    if len(locations_data) > 0:
+        selected_locations = pd.DataFrame(
+            {
+                "lat": map(lambda x: x["position"]["lat"], locations_data),
+                "lon": map(lambda x: x["position"]["lng"], locations_data),
+                "size": map(lambda x: 50, locations_data),
+                "title": map(lambda x: x["title"], locations_data),
+            }
+        )
+    else:
+        selected_locations = pd.DataFrame(
+            {"lat": [], "lon": [], "size": [], "title": []}
+        )
+
     # Draw the waypoints with hover data
     plot_obj.figure = px.scatter_mapbox(
-        selected_us_cities,
+        selected_locations,
         lat="lat",
         lon="lon",
-        size="Population",
-        hover_name=selected_us_cities.City,
-        hover_data=["State", "Population"],
+        size="size",
+        hover_name=selected_locations.title,
+        hover_data={"size": False},
         color_discrete_sequence=["fuchsia"],
         zoom=auto_zoom,
     )
@@ -582,7 +690,9 @@ def get_truck_data(image_base_url) -> dict:
 
     for idx, vehicle in enumerate(truck_data["vehicles"]):
         image_name = (
-            re.compile("#pic#([^#]+)").findall(vehicle["commercial"]["legacyMarketingField"])[0]
+            re.compile("#pic#([^#]+)").findall(
+                vehicle["commercial"]["legacyMarketingField"]
+            )[0]
             + ".png"
         )
 
@@ -598,7 +708,9 @@ def get_truck_data(image_base_url) -> dict:
             vehicle["product_url"] = ""
 
         vehicle["label"] = (
-            vehicle["commercial"]["manufacturer"] + " - " + vehicle["commercial"]["model"]
+            vehicle["commercial"]["manufacturer"]
+            + " - "
+            + vehicle["commercial"]["model"]
         )
 
         vehicle["value"] = idx

@@ -19,6 +19,11 @@ from simian.gui.component import Component
 from simian.gui.composed_component import PropertyEditor
 
 ACTION_CLASSES = []  # Is filled at the bottom of the module.
+DOC = """
+It also contains a custom <code>Composed</code> Component `actions_list` with:
+- an actions <code>Select</code> component with the image modifications that can be selected, and
+- a Simian <code>PropertyEditor</code> Composed Component for modifying the settings of the selected actions.
+"""
 
 
 def _refill_actions():
@@ -110,6 +115,8 @@ def action_changed(_meta_data: dict, payload: dict) -> dict:
                     p["maxLength"] = len(default_value)
 
             row["actionSettings"] = PropertyEditor.prepare_values(params)
+
+    utils.setSubmissionData(payload, "imageProcessingActions", image_actions)
 
     return payload
 
@@ -360,7 +367,7 @@ class InvertColours(ImageAction):
 
 
 class Mirror(ImageAction):
-    label = "Flip image horizonatally"
+    label = "Flip image horizontally"
     summary = "Mirrored"
     parameters = []
 
